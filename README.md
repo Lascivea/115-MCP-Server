@@ -16,15 +16,17 @@
 
 ## 快速开始
 
-如果你想最快跑起来，可以按这个顺序：
+最快的零安装方式（需要安装 [uv](https://docs.astral.sh/uv/)）：
 
-1. 创建虚拟环境
-2. 安装依赖
-3. 配置 `P115_COOKIES` 或 `P115_COOKIES_PATH`
-4. 启动 MCP 服务
-5. 在 MCP 客户端里接入
+```bash
+# 配置 Token（从 open.115.com 获取）
+export P115_REFRESH_TOKEN=your_refresh_token
 
-最简命令：
+# 直接运行，uvx 自动处理依赖
+uvx --from git+https://github.com/Lascivea/115-MCP-Server 115-MCP-Server
+```
+
+传统方式（源码安装）：
 
 ```bash
 python -m venv .venv
@@ -98,15 +100,37 @@ python -m venv .venv
 
 ### 认证方式
 
-本项目支持三种认证方式：
+本项目支持四种认证方式，按优先级排列：
 
-1. 直接传入环境变量 `P115_COOKIES`
-2. 通过环境变量 `P115_COOKIES_PATH` 指向 cookies 文件
-3. 通过 MCP 工具执行二维码登录
+1. **开放平台 Token**（推荐）：`P115_REFRESH_TOKEN` — 使用 115 官方 OAuth 授权
+2. **Cookies 字符串**：`P115_COOKIES` — 直接传入 cookies
+3. **Cookies 文件**：`P115_COOKIES_PATH` — 指向本地 `.txt` cookies 文件
+4. **扫码登录**：通过 MCP 工具 `start_qrcode_login` 动态获取
 
-> 本项目**不支持**通过项目根目录 `.env` 文件自动加载配置。配置来源只保留两种：运行进程时注入的环境变量，以及 `P115_COOKIES_PATH` 指向的本地 `.txt` cookies 文件。
+> 本项目**不支持**通过项目根目录 `.env` 文件自动加载配置。所有配置通过运行进程的环境变量注入。
 
-推荐使用环境变量 + `.txt` cookies 文件：
+#### 开放平台 Token（推荐）
+
+使用 115 官方开放平台（open.115.com）的 OAuth Token 认证，相比 cookies 更安全可控：
+
+```env
+P115_REFRESH_TOKEN=your_refresh_token
+# P115_ACCESS_TOKEN=可选，短期 access_token，客户端会自动刷新
+P115_ALLOW_QRCODE_LOGIN=false
+P115_CONSOLE_QRCODE=false
+```
+
+如何获取 Token：
+
+1. 访问 [115 开放平台](https://open.115.com) 注册应用
+2. 通过 OAuth 授权流程获取 `refresh_token` 和 `access_token`
+3. 参考 p115client 文档中的[授权登录示例](https://p115client.readthedocs.io/en/latest/)了解具体流程
+
+Token 认证优先级最高，当设置了 `P115_REFRESH_TOKEN` 时，服务会自动使用 `P115OpenClient` 初始化，忽略其他认证配置。
+
+#### Cookies 认证（原有方式）
+
+Cookies 方式适合已有登录会话的场景：
 
 ```env
 P115_COOKIES_PATH=~/115-cookies.txt
@@ -115,7 +139,7 @@ P115_ALLOW_QRCODE_LOGIN=false
 P115_CONSOLE_QRCODE=false
 ```
 
-也支持直接通过环境变量传入 cookies：
+也支持直接传入 cookies 字符串：
 
 ```env
 P115_COOKIES=UID=...; CID=...; SEID=...; KID=...
@@ -124,11 +148,11 @@ P115_COOKIES=UID=...; CID=...; SEID=...; KID=...
 说明：
 
 - `P115_COOKIES` 优先级高于 `P115_COOKIES_PATH`
-- `P115_COOKIES_PATH` 应指向本机上的 `.txt` cookies 文件，例如 `115-cookies.txt`
+- `P115_COOKIES_PATH` 应指向本机上的 `.txt` cookies 文件
 - 未配置 cookies 时，默认不会触发扫码登录
 - 若要允许 `p115client` 在需要时尝试扫码登录，请设置 `P115_ALLOW_QRCODE_LOGIN=true`
 
-- ### Cookie 平台自动推断
+### Cookie 平台自动推断
 
 服务默认依赖 `p115client` 根据 cookie 自动推断首选登录平台。
 
@@ -140,6 +164,15 @@ P115_COOKIES=UID=...; CID=...; SEID=...; KID=...
 4. 这样可以减少失败请求数量，降低触发风控的风险。
 
 ### 推荐的环境变量写法
+
+Token 模式（推荐）：
+
+```env
+P115_REFRESH_TOKEN=your_refresh_token
+FASTMCP_TRANSPORT=stdio
+```
+
+Cookies 模式：
 
 ```env
 P115_COOKIES_PATH=C:\Users\your-name\115-cookies.txt
@@ -228,6 +261,26 @@ P115_CONSOLE_QRCODE=false
 
 如果某个客户端支持以 `command + args + env` 的方式添加 MCP 服务，可直接套用：
 
+Token 模式（推荐，使用 uvx 零安装）：
+
+```json
+{
+  "mcpServers": {
+    "115-MCP-Server": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/Lascivea/115-MCP-Server", "115-MCP-Server"],
+      "env": {
+        "P115_REFRESH_TOKEN": "your_refresh_token",
+        "P115_ALLOW_QRCODE_LOGIN": "false",
+        "P115_CONSOLE_QRCODE": "false"
+      }
+    }
+  }
+}
+```
+
+Cookies 模式（传统方式）：
+
 ```json
 {
   "mcpServers": {
@@ -283,17 +336,24 @@ http://127.0.0.1:8000/mcp
 
 ## 使用方式
 
-### 常见使用流程 1：已有 cookies，直接使用
+### 常见使用流程 1：有 refresh_token，直接使用
+
+1. 设置环境变量 `P115_REFRESH_TOKEN`
+2. 启动服务
+3. 调用 `auth_status` 确认登录状态
+4. 正常使用所有文件操作功能
+
+### 常见使用流程 2：已有 cookies，直接使用
 
 1. 配置环境变量
 2. 启动服务
 3. 在客户端中调用：
-   - `auth_status`
+- `auth_status`（返回 `auth_mode`：`open`/`cookies`/`file`/`qrcode`/`missing`）
    - `list_directory`
    - `search_entries`
    - `offline_add_urls`
 
-### 常见使用流程 2：没有 cookies，先扫码登录
+### 常见使用流程 3：没有 cookies，先扫码登录
 
 1. 启动服务
 2. 调用 `start_qrcode_login`
@@ -302,7 +362,7 @@ http://127.0.0.1:8000/mcp
 5. 状态变成 `signed_in` 后，调用 `finish_qrcode_login`
 6. 保存返回的 cookies，后续直接复用
 
-### 常见使用流程 3：离线下载资源到 115
+### 常见使用流程 4：离线下载资源到 115
 
 1. 先用 `create_directory` 创建目标目录
 2. 用 `offline_add_urls` 添加下载链接
@@ -313,7 +373,7 @@ http://127.0.0.1:8000/mcp
    - `offline_remove_tasks`
    - `offline_clear_tasks`
 
-### 常见使用流程 4：整理和管理文件
+### 常见使用流程 5：整理和管理文件
 
 可组合调用：
 
@@ -697,11 +757,17 @@ dist\115-MCP-Server.exe
 
 ### 1. 提示未配置认证
 
-说明没有设置 `P115_COOKIES` 或 `P115_COOKIES_PATH`。
+说明没有设置 `P115_REFRESH_TOKEN`、`P115_COOKIES` 或 `P115_COOKIES_PATH`。选择一种认证方式配置即可。
 
 ### 2. 提示 cookies 文件不存在
 
 确认 `P115_COOKIES_PATH` 指向真实文件，路径需要是运行客户端那台机器上的本地路径。
+
+### 3. Token 认证失败 / token error
+
+- 检查 `P115_REFRESH_TOKEN` 是否正确
+- access_token 过期会自动用 refresh_token 刷新，无需手动处理
+- 如果 refresh_token 失效，需要重新走 OAuth 授权流程
 
 ### 3. 客户端连不上 MCP
 
