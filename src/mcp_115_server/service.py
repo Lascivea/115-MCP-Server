@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastmcp.exceptions import ToolError
-from p115client import P115Client, check_response
+from p115client import P115Client, P115OpenClient, check_response
 from p115client.fs import P115FileSystem
 from yarl import URL
 
@@ -290,30 +290,41 @@ class P115Service:
     def auth_status(self, validate_remote: bool = False) -> dict[str, Any]:
         status: dict[str, Any] = {
             "configured": self.settings.has_auth_configuration,
-            "cookies_source": self.settings.cookies_source,
+            "auth_mode": self.settings.auth_mode,
             "active_platform": self._active_platform,
             "check_for_relogin": self.settings.p115_check_for_relogin,
             "allow_qrcode_login": self.settings.p115_allow_qrcode_login,
             "console_qrcode": self.settings.p115_console_qrcode,
             "client_initialized": self._client_instance is not None,
         }
-        if self.settings.cookies_path is not None:
-            status["cookies_path"] = str(self.settings.cookies_path)
-            status["cookies_path_exists"] = self.settings.cookies_path.exists()
+        if self.settings.auth_mode == "open":
+            status["has_refresh_token"] = bool(self.settings.p115_refresh_token)
+            status["has_access_token"] = bool(self.settings.p115_access_token)
+        else:
+            status["cookies_source"] = self.settings.cookies_source
+            if self.settings.cookies_path is not None:
+                status["cookies_path"] = str(self.settings.cookies_path)
+                status["cookies_path_exists"] = self.settings.cookies_path.exists()
 
         if validate_remote:
             try:
-                status["remote_logged_in"] = self._with_client_fallback(
-                    "validate_remote_login",
-                    lambda client, _platform: bool(self._call_backend(client.login_status)),
-                )
+                if self.settings.auth_mode == "open":
+                    status["remote_logged_in"] = self._with_client_fallback(
+                        "validate_remote_login",
+                        lambda client, _platform: bool(self._call_backend(client.user_info)),
+                    )
+                else:
+                    status["remote_logged_in"] = self._with_client_fallback(
+                        "validate_remote_login",
+                        lambda client, _platform: bool(self._call_backend(client.login_status)),
+                    )
             except Exception as exc:  # noqa: BLE001
                 status["remote_logged_in"] = False
                 status["remote_error"] = self._format_backend_error(exc)
 
         if not status["configured"]:
             status["hint"] = (
-                "Set P115_COOKIES or P115_COOKIES_PATH. "
+                "Set P115_REFRESH_TOKEN (open platform), or P115_COOKIES / P115_COOKIES_PATH (cookies). "
                 "Enable P115_ALLOW_QRCODE_LOGIN only if your runtime can display the QR flow."
             )
 
@@ -1401,18 +1412,24 @@ class P115Service:
     def client(self) -> P115Client:
         with self._state_lock:
             if self._client_instance is None:
-                cookies_source: str | Path | None = self.settings.p115_cookies or self.settings.cookies_path
-                if self.settings.cookies_path is not None and not self.settings.cookies_path.exists():
-                    raise ToolError(f"Configured cookies file does not exist: {self.settings.cookies_path}")
-                if cookies_source is None and not self.settings.p115_allow_qrcode_login:
-                    raise ToolError(
-                        "115 authentication is not configured. Set P115_COOKIES or P115_COOKIES_PATH first."
+                if self.settings.auth_mode == "open":
+                    self._with_client_fallback(
+                        "initialize_client",
+                        lambda client, _platform: bool(self._call_backend(client.user_info)) or True,
                     )
-                self._with_client_fallback(
-                    "initialize_client",
-                    lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
-                    cookies_source=cookies_source,
-                )
+                else:
+                    cookies_source: str | Path | None = self.settings.p115_cookies or self.settings.cookies_path
+                    if self.settings.cookies_path is not None and not self.settings.cookies_path.exists():
+                        raise ToolError(f"Configured cookies file does not exist: {self.settings.cookies_path}")
+                    if cookies_source is None and not self.settings.p115_allow_qrcode_login:
+                        raise ToolError(
+                            "115 authentication is not configured. Set P115_COOKIES, P115_COOKIES_PATH, or P115_REFRESH_TOKEN first."
+                        )
+                    self._with_client_fallback(
+                        "initialize_client",
+                        lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
+                        cookies_source=cookies_source,
+                    )
             return self._client_instance
 
     def fs(self) -> P115FileSystem:
@@ -1487,14 +1504,21 @@ class P115Service:
     def _get_client_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115Client:
         with self._state_lock:
             normalized = self._normalize_platform(platform)
-            resolved_source = self._ensure_fresh_cookie_source(cookies_source)
             if normalized not in self._client_cache:
-                self._client_cache[normalized] = P115Client(
-                    resolved_source,
-                    check_for_relogin=self.settings.p115_check_for_relogin,
-                    app=normalized,
-                    console_qrcode=self.settings.p115_console_qrcode,
-                )
+                if self.settings.auth_mode == "open":
+                    self._client_cache[normalized] = P115OpenClient(
+                        refresh_token=self.settings.p115_refresh_token,
+                        access_token=self.settings.p115_access_token or "",
+                        console_qrcode=self.settings.p115_console_qrcode,
+                    )
+                else:
+                    resolved_source = self._ensure_fresh_cookie_source(cookies_source)
+                    self._client_cache[normalized] = P115Client(
+                        resolved_source,
+                        check_for_relogin=self.settings.p115_check_for_relogin,
+                        app=normalized,
+                        console_qrcode=self.settings.p115_console_qrcode,
+                    )
             return self._client_cache[normalized]
 
     def _get_fs_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115FileSystem:

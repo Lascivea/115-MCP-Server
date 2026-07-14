@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     p115_allow_qrcode_login: bool = Field(default=False, alias="P115_ALLOW_QRCODE_LOGIN")
     p115_console_qrcode: bool = Field(default=False, alias="P115_CONSOLE_QRCODE")
 
+    p115_access_token: str | None = Field(default=None, alias="P115_ACCESS_TOKEN")
+    p115_refresh_token: str | None = Field(default=None, alias="P115_REFRESH_TOKEN")
+
     fastmcp_transport: str = Field(default="stdio", alias="FASTMCP_TRANSPORT")
     fastmcp_host: str = Field(default="127.0.0.1", alias="FASTMCP_HOST")
     fastmcp_port: int = Field(default=8000, alias="FASTMCP_PORT")
@@ -41,8 +44,20 @@ class Settings(BaseSettings):
         return Path(self.p115_cookies_path).expanduser()
 
     @property
+    def auth_mode(self) -> str:
+        if self.p115_refresh_token:
+            return "open"
+        if self.p115_cookies:
+            return "cookies"
+        if self.p115_cookies_path:
+            return "file"
+        if self.p115_allow_qrcode_login:
+            return "qrcode"
+        return "missing"
+
+    @property
     def has_auth_configuration(self) -> bool:
-        return bool(self.p115_cookies or self.p115_cookies_path or self.p115_allow_qrcode_login)
+        return bool(self.p115_cookies or self.p115_cookies_path or self.p115_allow_qrcode_login or self.p115_refresh_token)
 
     @property
     def cookies_source(self) -> str:
