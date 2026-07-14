@@ -9,10 +9,10 @@ from enum import StrEnum
 from os import PathLike
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+
 
 from fastmcp.exceptions import ToolError
-from p115client import P115Client, P115OpenClient, check_response
+from p115client import P115OpenClient, check_response
 from p115client.fs import P115FileSystem
 from yarl import URL
 
@@ -21,40 +21,6 @@ from .config import Settings
 
 logger = logging.getLogger(__name__)
 
-
-DEFAULT_PLATFORM_CANDIDATES = (
-    "web",
-    "desktop",
-    "harmony",
-    "apple_tv",
-    "android",
-    "qandroid",
-    "ios",
-    "115ios",
-    "ipad",
-    "115ipad",
-    "wechatmini",
-    "alipaymini",
-    "tv",
-    "windows",
-    "mac",
-    "linux",
-    "os_windows",
-    "os_mac",
-    "os_linux",
-)
-
-WEB_LIKE_PLATFORMS = {
-    "web",
-    "desktop",
-    "harmony",
-    "windows",
-    "mac",
-    "linux",
-    "os_windows",
-    "os_mac",
-    "os_linux",
-}
 
 ID_KEYS = {
     "id",
@@ -138,14 +104,14 @@ class P115Service:
         self._client_cache: dict[str | None, P115Client] = {}
         self._fs_cache: dict[str | None, P115FileSystem] = {}
         self._active_platform: str | None = None
-        self._qrcode_sessions: dict[str, dict[str, Any]] = {}
-        self._cookie_source_signature: tuple[Any, ...] | None = None
+
         self._state_lock = threading.RLock()
         self._offline_lane_lock = threading.RLock()
         self._offline_snapshot_condition = threading.Condition()
         self._offline_task_snapshots: dict[str, dict[str, Any]] = {}
         self._offline_snapshot_inflight: set[str] = set()
         self._offline_generation = 0
+        self._rate_limit_last = 0.0
 
     def _debug_log(self, event: str, **fields: Any) -> None:
         if not self.settings.p115_debug_logging:
@@ -323,90 +289,9 @@ class P115Service:
                 status["remote_error"] = self._format_backend_error(exc)
 
         if not status["configured"]:
-            status["hint"] = (
-                "Set P115_REFRESH_TOKEN (open platform), or P115_COOKIES / P115_COOKIES_PATH (cookies). "
-                "Enable P115_ALLOW_QRCODE_LOGIN only if your runtime can display the QR flow."
-            )
+            status["hint"] = "Set P115_REFRESH_TOKEN (from open.115.com)."
 
         return status
-
-    def start_qrcode_login(self, app: str = "alipaymini") -> dict[str, Any]:
-        selected_app = app.strip() or "alipaymini"
-        response = self._call_backend(check_response, P115Client.login_qrcode_token())
-        token = response["data"]
-        session_id = uuid4().hex
-        uid = str(token["uid"])
-        qrcode_url = token.get("qrcode") or f"https://115.com/scan/dg-{uid}"
-        with self._state_lock:
-            self._qrcode_sessions[session_id] = {
-                "app": selected_app,
-                "uid": uid,
-                "token": {
-                    "uid": token["uid"],
-                    "time": token["time"],
-                    "sign": token["sign"],
-                },
-                "qrcode_url": qrcode_url,
-            }
-        return {
-            "session_id": session_id,
-            "app": selected_app,
-            "uid": uid,
-            "qrcode_url": qrcode_url,
-        }
-
-    def get_qrcode_login_status(self, session_id: str) -> dict[str, Any]:
-        session = self._get_qrcode_session(session_id)
-        response = self._call_backend(check_response, P115Client.login_qrcode_scan_status(session["token"]))
-        status = int(response["data"].get("status", 0))
-        status_name = {
-            0: "waiting",
-            1: "scanned",
-            2: "signed_in",
-            -1: "expired",
-            -2: "canceled",
-        }.get(status, f"unknown_{status}")
-        return {
-            "session_id": session_id,
-            "app": session["app"],
-            "uid": session["uid"],
-            "status": status,
-            "status_name": status_name,
-            "result": self._normalize(response),
-        }
-
-    def finish_qrcode_login(self, session_id: str, output_path: str = "") -> dict[str, Any]:
-        session = self._get_qrcode_session(session_id)
-        response = self._call_backend(
-            check_response,
-            P115Client.login_qrcode_scan_result(session["uid"], app=session["app"]),
-        )
-        cookies = str(response["data"]["cookie"])
-        saved_to = ""
-        if output_path.strip():
-            destination = Path(output_path).expanduser().resolve()
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(cookies, encoding="utf-8")
-            saved_to = str(destination)
-        preferred_platform = session["app"] if session["app"] else None
-        self._reset_client_state()
-        self._cookie_source_signature = None
-        self._with_client_fallback(
-            "activate_qrcode_cookies",
-            lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
-            preferred_platform=preferred_platform,
-            cookies_source=cookies,
-        )
-        with self._state_lock:
-            self._qrcode_sessions.pop(session_id, None)
-        return {
-            "session_id": session_id,
-            "app": session["app"],
-            "uid": session["uid"],
-            "cookies": cookies,
-            "saved_to": saved_to,
-            "result": self._normalize(response),
-        }
 
     def list_directory(
         self,
@@ -1438,186 +1323,45 @@ class P115Service:
                 self._fs_instance = self._get_fs_for_platform(self._active_platform)
             return self._fs_instance
 
-    def _normalize_platform(self, platform: str | None) -> str | None:
-        if platform is None:
-            return None
-        normalized = platform.strip()
-        return normalized or None
-
-    def _effective_platform(self, client: P115Client, platform: str | None) -> str | None:
-        normalized = self._normalize_platform(platform)
-        if normalized is not None:
-            return normalized
-        cookies_obj = getattr(client, "cookies_str", None)
-        inferred = getattr(cookies_obj, "login_app", None)
-        return self._normalize_platform(inferred)
-
-    def _platform_candidates(self, preferred_platform: str | None = None) -> list[str | None]:
-        normalized = self._normalize_platform(preferred_platform)
-        if normalized is None:
-            return [None]
-        return [normalized, None]
-
-    def _is_web_like_platform(self, platform: str | None, client: P115Client | None = None) -> bool:
-        normalized = self._normalize_platform(platform)
-        if normalized is None and client is not None:
-            normalized = self._effective_platform(client, None)
-        return normalized is None or normalized in WEB_LIKE_PLATFORMS
-
-    def _cookies_source(self, cookies_source: str | Path | None = None) -> str | Path | None:
-        resolved = cookies_source if cookies_source is not None else self.settings.p115_cookies or self.settings.cookies_path
-        if isinstance(resolved, Path) and not resolved.exists():
-            raise ToolError(f"Configured cookies file does not exist: {resolved}")
-        if resolved is None and not self.settings.p115_allow_qrcode_login:
-            raise ToolError("115 authentication is not configured. Set P115_COOKIES or P115_COOKIES_PATH first.")
-        return resolved
-
-    def _cookie_source_fingerprint(self, cookies_source: str | PathLike[str] | None) -> tuple[Any, ...]:
-        if cookies_source is None:
-            return ("none",)
-        if isinstance(cookies_source, PathLike):
-            path = Path(cookies_source)
-            try:
-                st = path.stat()
-                return ("path", str(path.resolve()), st.st_mtime, st.st_size)
-            except OSError:
-                return ("path", str(path.resolve()), None, None)
-        return ("inline", str(cookies_source))
-
-    def _reset_client_state(self) -> None:
+    def _get_client(self) -> P115OpenClient:
         with self._state_lock:
-            self._client_instance = None
-            self._fs_instance = None
-            self._client_cache.clear()
-            self._fs_cache.clear()
-            self._active_platform = None
+            if None not in self._client_cache:
+                self._client_cache[None] = P115OpenClient(
+                    refresh_token=self.settings.p115_refresh_token,
+                    access_token=self.settings.p115_access_token or "",
+                )
+            return self._client_cache[None]
 
-    def _ensure_fresh_cookie_source(self, cookies_source: str | Path | None = None) -> str | Path | None:
+    def _get_fs(self) -> P115FileSystem:
         with self._state_lock:
-            resolved = self._cookies_source(cookies_source)
-            fingerprint = self._cookie_source_fingerprint(resolved)
-            if self._cookie_source_signature != fingerprint:
-                self._reset_client_state()
-                self._cookie_source_signature = fingerprint
-            return resolved
-
-    def _get_client_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115Client:
-        with self._state_lock:
-            normalized = self._normalize_platform(platform)
-            if normalized not in self._client_cache:
-                if self.settings.auth_mode == "open":
-                    self._client_cache[normalized] = P115OpenClient(
-                        refresh_token=self.settings.p115_refresh_token,
-                        access_token=self.settings.p115_access_token or "",
-                        console_qrcode=self.settings.p115_console_qrcode,
-                    )
-                else:
-                    resolved_source = self._ensure_fresh_cookie_source(cookies_source)
-                    self._client_cache[normalized] = P115Client(
-                        resolved_source,
-                        check_for_relogin=self.settings.p115_check_for_relogin,
-                        app=normalized,
-                        console_qrcode=self.settings.p115_console_qrcode,
-                    )
-            return self._client_cache[normalized]
-
-    def _get_fs_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115FileSystem:
-        with self._state_lock:
-            normalized = self._normalize_platform(platform)
-            if normalized not in self._fs_cache:
-                self._fs_cache[normalized] = P115FileSystem(self._get_client_for_platform(normalized, cookies_source=cookies_source))
-            return self._fs_cache[normalized]
-
-    def _remember_active_platform(self, platform: str | None, client: P115Client | None = None) -> None:
-        with self._state_lock:
-            active_client = client or self._get_client_for_platform(platform)
-            normalized = self._effective_platform(active_client, platform)
-            self._active_platform = normalized
-            self._client_cache[normalized] = active_client
-            self._client_instance = active_client
-            active_fs = self._fs_cache.get(normalized)
-            if active_fs is None:
-                active_fs = P115FileSystem(active_client)
-                self._fs_cache[normalized] = active_fs
-            self._fs_instance = active_fs
+            if None not in self._fs_cache:
+                self._fs_cache[None] = P115FileSystem(self._get_client())
+            return self._fs_cache[None]
 
     def _with_client_fallback(self, operation: str, callback, *, preferred_platform: str | None = None, cookies_source: str | Path | None = None, request_id: str | None = None):
-        errors: list[str] = []
-        for platform in self._platform_candidates(preferred_platform):
-            attempt_start = time.perf_counter()
-            client = self._get_client_for_platform(platform, cookies_source=cookies_source)
-            effective_platform = self._effective_platform(client, platform)
-            self._debug_log(
-                "client_fallback.attempt.start",
-                request_id=request_id,
-                operation=operation,
-                platform=platform,
-                effective_platform=effective_platform,
-            )
-            try:
-                result = callback(client, platform)
-                self._remember_active_platform(platform, client=client)
-                self._debug_log(
-                    "client_fallback.attempt.success",
-                    request_id=request_id,
-                    operation=operation,
-                    platform=platform,
-                    effective_platform=effective_platform,
-                    elapsed_ms=self._elapsed_ms(attempt_start),
-                )
-                return result
-            except Exception as exc:  # noqa: BLE001
-                formatted = self._format_backend_error(exc)
-                errors.append(f"{platform or 'default'}: {formatted}")
-                retryable = self._should_retry_platform(exc)
-                self._debug_log(
-                    "client_fallback.attempt.failure",
-                    request_id=request_id,
-                    operation=operation,
-                    platform=platform,
-                    effective_platform=effective_platform,
-                    elapsed_ms=self._elapsed_ms(attempt_start),
-                    retryable=retryable,
-                    error=formatted,
-                )
-                if not retryable:
-                    raise ToolError(formatted) from exc
-        raise ToolError(f"{operation} failed across platforms: {' | '.join(errors)}")
+        client = self._get_client()
+        with self._state_lock:
+            self._client_instance = client
+            if self._fs_instance is None:
+                self._fs_instance = P115FileSystem(client)
+        return callback(client, None)
 
-    def _with_fs_fallback(self, operation: str, callback, *, preferred_platform: str | None = None):
-        return self._with_client_fallback(
-            operation,
-            lambda _client, platform: callback(self._get_fs_for_platform(platform), platform),
-            preferred_platform=preferred_platform,
-        )
-
-    def _client_call(self, method_name: str, *args, preferred_platform: str | None = None, check: bool = True, request_id: str | None = None, **kwargs):
-        def attempt(client: P115Client, _platform: str | None):
+    def _client_call(self, method_name: str, *args, check: bool = True, request_id: str | None = None, **kwargs):
+        def attempt(client, _platform):
             call_start = time.perf_counter()
-            self._debug_log(
-                "client_call.start",
-                request_id=request_id,
-                method_name=method_name,
-                check=check,
-            )
+            self._debug_log("client_call.start", request_id=request_id, method_name=method_name, check=check)
             response = self._call_backend(getattr(client, method_name), *args, **kwargs)
             checked = self._call_backend(check_response, response) if check else response
-            self._debug_log(
-                "client_call.success",
-                request_id=request_id,
-                method_name=method_name,
-                elapsed_ms=self._elapsed_ms(call_start),
-            )
+            self._debug_log("client_call.success", request_id=request_id, method_name=method_name, elapsed_ms=self._elapsed_ms(call_start))
             return checked
+        return self._with_client_fallback(method_name, attempt, request_id=request_id)
 
-        return self._with_client_fallback(method_name, attempt, preferred_platform=preferred_platform, request_id=request_id)
-
-    def _fs_call(self, method_name: str, *args, preferred_platform: str | None = None, **kwargs):
-        return self._with_fs_fallback(
-            method_name,
-            lambda fs, _platform: self._call_backend(getattr(fs, method_name), *args, **kwargs),
-            preferred_platform=preferred_platform,
-        )
+    def _fs_call(self, method_name: str, *args, **kwargs):
+        with self._state_lock:
+            if self._fs_instance is None:
+                self._fs_instance = P115FileSystem(self._get_client())
+            self._client_instance = self._fs_instance.client
+        return self._call_backend(getattr(self._fs_instance, method_name), *args, **kwargs)
 
     def _resolve_directory_id(self, *, remote_id: str | int | None, remote_path: str | None, allow_root_default: bool) -> int:
         if remote_id is not None and remote_path:
@@ -1627,149 +1371,25 @@ class P115Service:
         if remote_path:
             if remote_path == "/":
                 return 0
-
-            def attempt(client: P115Client, platform: str | None):
-                if self._is_web_like_platform(platform, client):
-                    response = self._call_backend(client.fs_dir_getid, remote_path)
-                else:
-                    response = self._call_backend(client.fs_dir_getid_app, remote_path, app=self._effective_platform(client, platform) or "android")
-                checked = self._call_backend(check_response, response)
-                return self._parse_remote_id(str(checked.get("id") or checked.get("cid") or checked["file_id"]), "directory_id")
-
-            return self._with_client_fallback("resolve_directory_id", attempt)
+            client = self._get_client()
+            response = self._call_backend(client.fs_files, {"cid": 0, "limit": 1, "offset": 0, "search_value": "", "show_dir": 1})
+            checked = self._call_backend(check_response, response)
+            return self._parse_remote_id(str(checked.get("id") or checked.get("cid") or checked["file_id"]), "directory_id")
         if allow_root_default:
             return 0
         raise ToolError("A target id or path is required.")
 
-    def _offline_add_urls_with_platform(self, client: P115Client, platform: str | None, *, request_id: str | None = None, open_payload: dict[str, Any], legacy_payload: dict[str, Any]):
-        def attempt_submit(label: str, func, *args, **kwargs):
-            submit_start = time.perf_counter()
-            self._debug_log(
-                "offline_add_urls.submit.start",
-                request_id=request_id,
-                platform=platform,
-                effective_platform=self._effective_platform(client, platform),
-                method=label,
-                legacy_url_count=sum(1 for key in legacy_payload if key.startswith("url[")),
-                open_url_count=len([line for line in str(open_payload.get("urls", "")).splitlines() if line]),
-                has_remote_dir=("wp_path_id" in open_payload) or ("wp_path_id" in legacy_payload),
-            )
-            try:
-                result = self._call_backend(func, *args, **kwargs)
-                self._debug_log(
-                    "offline_add_urls.submit.success",
-                    request_id=request_id,
-                    platform=platform,
-                    effective_platform=self._effective_platform(client, platform),
-                    method=label,
-                    elapsed_ms=self._elapsed_ms(submit_start),
-                )
-                return result
-            except Exception as exc:  # noqa: BLE001
-                self._debug_log(
-                    "offline_add_urls.submit.failure",
-                    request_id=request_id,
-                    platform=platform,
-                    effective_platform=self._effective_platform(client, platform),
-                    method=label,
-                    elapsed_ms=self._elapsed_ms(submit_start),
-                    error=self._format_backend_error(exc),
-                )
-                raise
+    def _offline_add_urls_with_platform(self, client, platform, *, request_id=None, open_payload, legacy_payload):
+        response = self._call_backend(client.clouddownload_task_add_urls_open, open_payload)
+        return self._call_backend(check_response, response)
 
-        if self._is_web_like_platform(platform, client):
-            try:
-                response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
-                return self._call_backend(check_response, response)
-            except Exception as exc:
-                if _is_programming_error(exc):
-                    raise
-                response = attempt_submit("legacy:ssp", client.offline_add_urls, legacy_payload, type="ssp")
-                return self._call_backend(check_response, response)
-        try:
-            response = attempt_submit("open", client.offline_add_urls_open, open_payload)
-            return self._call_backend(check_response, response)
-        except Exception as exc:
-            if _is_programming_error(exc):
-                raise
-            try:
-                response = attempt_submit("legacy:ssp", client.offline_add_urls, legacy_payload, type="ssp")
-                return self._call_backend(check_response, response)
-            except Exception as exc:
-                if _is_programming_error(exc):
-                    raise
-                response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
-                return self._call_backend(check_response, response)
+    def _offline_list_tasks_with_platform(self, client, platform, page, *, request_id=None):
+        response = self._call_backend(check_response, self._call_backend(client.clouddownload_task_list_open, page))
+        return response
 
-    def _offline_list_tasks_with_platform(self, client: P115Client, platform: str | None, page: int, *, request_id: str | None = None):
-        def attempt_fetch(label: str, func, *args, **kwargs):
-            fetch_start = time.perf_counter()
-            self._debug_log(
-                "offline_list_tasks.fetch.start",
-                request_id=request_id,
-                platform=platform,
-                effective_platform=self._effective_platform(client, platform),
-                method=label,
-                page=page,
-            )
-            try:
-                response = self._call_backend(check_response, self._call_backend(func, *args, **kwargs))
-                data = response.get("data", response)
-                self._debug_log(
-                    "offline_list_tasks.fetch.success",
-                    request_id=request_id,
-                    platform=platform,
-                    effective_platform=self._effective_platform(client, platform),
-                    method=label,
-                    page=page,
-                    elapsed_ms=self._elapsed_ms(fetch_start),
-                    count=data.get("count"),
-                    page_count=data.get("page_count"),
-                )
-                return response
-            except Exception as exc:
-                self._debug_log(
-                    "offline_list_tasks.fetch.failure",
-                    request_id=request_id,
-                    platform=platform,
-                    effective_platform=self._effective_platform(client, platform),
-                    method=label,
-                    page=page,
-                    elapsed_ms=self._elapsed_ms(fetch_start),
-                    error=self._format_backend_error(exc),
-                )
-                raise
-
-        if self._is_web_like_platform(platform, client):
-            return attempt_fetch("legacy:web", client.offline_list, {"page": page, "page_size": 1150}, type="web")
-        try:
-            return attempt_fetch("open", client.offline_list_open, page)
-        except Exception as exc:
-            if _is_programming_error(exc):
-                raise
-            return attempt_fetch("legacy:ssp", client.offline_list, {"page": page, "page_size": 1150}, type="ssp")
-
-    def _offline_remove_task_with_platform(self, client: P115Client, platform: str | None, info_hash: str, delete_source_file: bool):
-        payload_open = {"info_hash": info_hash, "del_source_file": int(delete_source_file)}
-        payload_legacy = {"hash[0]": info_hash, "flag": int(delete_source_file)}
-        if self._is_web_like_platform(platform, client):
-            try:
-                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
-            except Exception as exc:
-                if _is_programming_error(exc):
-                    raise
-                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="ssp"))
-        try:
-            return self._call_backend(check_response, self._call_backend(client.offline_remove_open, payload_open))
-        except Exception as exc:
-            if _is_programming_error(exc):
-                raise
-            try:
-                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="ssp"))
-            except Exception as exc:
-                if _is_programming_error(exc):
-                    raise
-                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
+    def _offline_remove_task_with_platform(self, client, platform, info_hash, delete_source_file):
+        payload = {"info_hash": info_hash, "del_source_file": int(delete_source_file)}
+        return self._call_backend(check_response, self._call_backend(client.clouddownload_task_del_open, payload))
 
     def _list_all_offline_tasks(self, status: str = "") -> list[dict[str, Any]]:
         snapshot = self._list_all_offline_tasks_cached(status=status)
@@ -1836,28 +1456,6 @@ class P115Service:
         return []
 
     @classmethod
-    def _should_retry_platform(cls, exc: Exception) -> bool:
-        message = cls._format_backend_error(exc).lower()
-        retry_markers = (
-            "authorization",
-            "请重新登录",
-            "重新登录",
-            "ip登录异常",
-            "login",
-            "cookie",
-            "sign",
-            "sso",
-            "token",
-            "forbidden",
-            "401",
-            "403",
-            '"errno": 99',
-            '"errno":99',
-            '"errcode": 99',
-            '"errcode":99',
-        )
-        return any(marker in message for marker in retry_markers)
-
     @staticmethod
     def _normalize(value: Any) -> Any:
         if isinstance(value, (str, int, float, bool)) or value is None:
@@ -1896,14 +1494,25 @@ class P115Service:
             return message
         return exc.__class__.__name__
 
-    @classmethod
-    def _call_backend(cls, func, /, *args, **kwargs):
+    def _throttle(self) -> None:
+        rate = self.settings.p115_rate_limit
+        if rate <= 0:
+            return
+        interval = 1.0 / rate
+        now = time.monotonic()
+        elapsed = now - self._rate_limit_last
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
+        self._rate_limit_last = time.monotonic()
+
+    def _call_backend(self, func, /, *args, **kwargs):
+        self._throttle()
         try:
             return func(*args, **kwargs)
         except ToolError:
             raise
-        except Exception as exc:  # noqa: BLE001
-            raise ToolError(cls._format_backend_error(exc)) from exc
+        except Exception as exc:
+            raise ToolError(self._format_backend_error(exc)) from exc
 
     def _resolve_many_sources(
         self,
@@ -1924,16 +1533,6 @@ class P115Service:
                 resolved_ids.append(self._parse_remote_id(str(metadata["id"]), "source_ids"))
             return resolved_ids
         raise ToolError("Provide at least one source id or source path.")
-
-    def _get_qrcode_session(self, session_id: str) -> dict[str, Any]:
-        normalized_id = session_id.strip()
-        if not normalized_id:
-            raise ToolError("session_id must not be empty.")
-        with self._state_lock:
-            try:
-                return self._qrcode_sessions[normalized_id]
-            except KeyError as exc:
-                raise ToolError(f"Unknown qrcode login session: {normalized_id}") from exc
 
     @staticmethod
     def _resolve_remote(

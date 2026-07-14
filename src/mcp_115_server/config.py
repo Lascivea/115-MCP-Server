@@ -20,14 +20,10 @@ class Settings(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         return init_settings, env_settings, file_secret_settings
 
-    p115_cookies: str | None = Field(default=None, alias="P115_COOKIES")
-    p115_cookies_path: str | None = Field(default=None, alias="P115_COOKIES_PATH")
-    p115_check_for_relogin: bool = Field(default=True, alias="P115_CHECK_FOR_RELOGIN")
-    p115_allow_qrcode_login: bool = Field(default=False, alias="P115_ALLOW_QRCODE_LOGIN")
-    p115_console_qrcode: bool = Field(default=False, alias="P115_CONSOLE_QRCODE")
-
     p115_access_token: str | None = Field(default=None, alias="P115_ACCESS_TOKEN")
     p115_refresh_token: str | None = Field(default=None, alias="P115_REFRESH_TOKEN")
+
+    p115_rate_limit: int = Field(default=1, alias="P115_RATE_LIMIT", ge=0)
 
     fastmcp_transport: str = Field(default="stdio", alias="FASTMCP_TRANSPORT")
     fastmcp_host: str = Field(default="127.0.0.1", alias="FASTMCP_HOST")
@@ -38,36 +34,8 @@ class Settings(BaseSettings):
     p115_debug_log_file: str | None = Field(default="./logs/115-mcp-debug.log", alias="P115_DEBUG_LOG_FILE")
 
     @property
-    def cookies_path(self) -> Path | None:
-        if not self.p115_cookies_path:
-            return None
-        return Path(self.p115_cookies_path).expanduser()
-
-    @property
-    def auth_mode(self) -> str:
-        if self.p115_refresh_token:
-            return "open"
-        if self.p115_cookies:
-            return "cookies"
-        if self.p115_cookies_path:
-            return "file"
-        if self.p115_allow_qrcode_login:
-            return "qrcode"
-        return "missing"
-
-    @property
     def has_auth_configuration(self) -> bool:
-        return bool(self.p115_cookies or self.p115_cookies_path or self.p115_allow_qrcode_login or self.p115_refresh_token)
-
-    @property
-    def cookies_source(self) -> str:
-        if self.p115_cookies:
-            return "env"
-        if self.p115_cookies_path:
-            return "file"
-        if self.p115_allow_qrcode_login:
-            return "qrcode"
-        return "missing"
+        return bool(self.p115_refresh_token)
 
     @property
     def debug_log_file_path(self) -> Path | None:
